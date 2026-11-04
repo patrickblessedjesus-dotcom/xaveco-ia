@@ -40,7 +40,16 @@ const CFG = {
   // Tela de teste (/teste?k=SENHA). Sem senha = desligada.
   testeSenha: E.TESTE_SENHA || "",
   dbUrl: E.DATABASE_URL || "",
+  // WhatsApp via WATI (se WATI_TOKEN estiver preenchido, a Wati é usada no lugar da Meta)
+  watiUrl: (E.WATI_API_URL || "").replace(/\/+$/, ""),   // "endpoint" copiado no painel da Wati
+  watiToken: (E.WATI_TOKEN || "").replace(/^Bearer\s+/i, ""),
+  watiCanal: (E.WATI_CANAL || "").replace(/\D/g, ""),     // número do Xaveco na Wati
+  watiSecret: E.WATI_SECRET || "",                         // senha no fim da URL do webhook
 };
+setImmediate(() => { [["Tenho 18+", "idade_sim"], ["Sou menor", "idade_nao"], [`Semana ${brl(CFG.planos.semana.valor)}`, "plano_semana"], [`Mês ${brl(CFG.planos.mes.valor)}`, "plano_mes"]]
+  .forEach(([tt, id]) => { TITULO_ID[normTit(tt.slice(0, 20))] = id; }); });
+const usaWati = () => !!(CFG.watiToken && CFG.watiUrl);
+const watiHost = () => { try { return new URL(CFG.watiUrl).origin; } catch { return "https://live-mt-server.wati.io"; } };
 
 const brl = v => Number(v).toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
 const hojeSP = () => new Date().toLocaleDateString("en-CA", { timeZone: "America/Sao_Paulo" }); // AAAA-MM-DD
@@ -100,11 +109,77 @@ async function wa(payload) {
   });
   if (!r.ok) log("Erro WhatsApp", r.status, await r.text());
 }
-const enviarTexto = (to, body) => wa({ to, type: "text", text: { body, preview_url: false } });
-const enviarBotoes = (to, body, botoes) => wa({ to, type: "interactive", interactive: { type: "button", body: { text: body },
-  action: { buttons: botoes.slice(0, 3).map(b => ({ type: "reply", reply: { id: b.id, title: b.titulo.slice(0, 20) } })) } } });
+// ---------- WATI ----------
+async function wati(metodo, url, opts = {}) {
+  const r = await fetch(url, { method: metodo, ...opts, headers: { Authorization: `Bearer ${CFG.watiToken}`, Accept: "application/json", ...(opts.headers || {}) } });
+  const txt = await r.text().catch(() => "");
+  let j = {}; try { j = JSON.parse(txt); } catch {}
+  const ok = r.ok && j.result !== false && j.ok !== false;
+  if (!ok) log("Wati", metodo, url.replace(CFG.watiToken, "***").slice(0, 120), r.status, txt.slice(0, 300));
+  return ok;
+}
+const alvoWati = to => (CFG.watiCanal ? CFG.watiCanal + ":" : "") + to;
+async function watiTexto(to, text) {
+  const v3 = await wati("POST", `${watiHost()}/api/ext/v3/conversations/messages/text`, {
+    headers: { "Content-Type": "application/json" }, body: JSON.stringify({ target: alvoWati(to), text }) });
+  if (v3 || !/\/\d+$|\/[a-z0-9-]{5,}$/i.test(CFG.watiUrl)) return;
+  const q = new URLSearchParams({ messageText: text }); if (CFG.watiCanal) q.set("channelPhoneNumber", CFG.watiCanal);
+  await wati("POST", `${CFG.watiUrl}/api/v1/sendSessionMessage/${to}?${q}`);
+}
+async function watiBotoes(to, body, botoes) {
+  const ok = await wati("POST", `${watiHost()}/api/ext/v3/conversations/messages/interactive`, {
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ target: alvoWati(to), type: "buttons", button_message: { body, buttons: botoes.slice(0, 3).map(b => ({ text: b.titulo.slice(0, 20) })) } }) });
+  if (!ok) await watiTexto(to, body + "\n\n" + botoes.map((b, i) => `*${i + 1}* - ${b.titulo}`).join("\n"));
+  botoesPendentes.set(to, Object.fromEntries(botoes.map((b, i) => [String(i + 1), b.id])));
+}
+async function watiArquivo(to, buf, nome, mime) {
+  const fd = new FormData(); fd.append("file", new Blob([buf], { type: mime }), nome);
+  const q = new URLSearchParams(); if (CFG.watiCanal) q.set("channelPhoneNumber", CFG.watiCanal);
+  return wati("POST", `${CFG.watiUrl}/api/v1/sendSessionFile/${to}?${q}`, { body: fd });
+}
+async function watiBaixar(m) {
+  const tentativas = [];
+  const d = typeof m.data === "string" ? m.data : (m.data && (m.data.url || m.data.mediaUrl || m.data.fileName)) || m.mediaUrl || "";
+  if (/^https?:/.test(d)) tentativas.push(d);
+  else if (d) tentativas.push(`${CFG.watiUrl}/api/v1/getMedia?fileName=${encodeURIComponent(d)}`);
+  if (m.id) tentativas.push(`${watiHost()}/api/ext/v3/conversations/messages/file/${m.id}`);
+  for (const u of tentativas) {
+    const r = await fetch(u, { headers: { Authorization: `Bearer ${CFG.watiToken}` } }).catch(() => null);
+    if (r && r.ok) {
+      const buf = Buffer.from(await r.arrayBuffer());
+      let mime = (r.headers.get("content-type") || "").split(";")[0];
+      if (!mime || /octet|json|text/.test(mime)) mime = m.type === "image" ? "image/jpeg" : "audio/ogg";
+      if (buf.length > 100) return { buf, mime };
+    }
+  }
+  throw new Error("não consegui baixar a mídia da Wati");
+}
+// título do botão → id interno (a Wati devolve o texto do botão)
+const TITULO_ID = {};
+const normTit = x => String(x).replace(/\u00a0/g, " ").trim().toLowerCase();
+const botoesPendentes = new Map();
+// converte o evento da Wati no formato que o fluxo entende
+async function deWati(b) {
+  if (!b || b.owner === true || b.eventType && !/^(message|newContactMessageReceived)/.test(b.eventType)) return null;
+  const from = String(b.waId || b.whatsappNumber || "").replace(/\D/g, "");
+  if (!from) return null;
+  const m = { id: b.whatsappMessageId || b.id || ("w" + Date.now()), from, _nome: b.senderName || "" };
+  const rep = b.interactiveButtonReply || b.buttonReply || b.listReply;
+  const tipo = String(b.type || "text").toLowerCase();
+  if (rep) { const tit = String(rep.title || rep.text || rep.payload || "").trim(); m.type = "interactive"; m.interactive = { button_reply: { id: TITULO_ID[normTit(tit)] || rep.id || tit } }; }
+  else if (tipo === "image" || (tipo === "document" && /\.(jpe?g|png|webp)/i.test(JSON.stringify(b.data || "")))) { m.type = "image"; m.image = { caption: b.text || "" }; m._imagem = await watiBaixar({ ...b, type: "image" }); }
+  else if (tipo === "audio" || tipo === "voice" || tipo === "ptt") { m.type = "audio"; m.audio = {}; m._audio = await watiBaixar({ ...b, type: "audio" }); }
+  else if (tipo === "text" || tipo === "button" || tipo === "interactive") { m.type = "text"; m.text = { body: String(b.text || "") }; }
+  else m.type = tipo;
+  return m;
+}
+
+const enviarTexto = (to, body) => (usaWati() && !to.startsWith("teste:")) ? watiTexto(to, body) : wa({ to, type: "text", text: { body, preview_url: false } });
+const enviarBotoes = (to, body, botoes) => { botoes.forEach(b => { TITULO_ID[normTit(b.titulo.slice(0, 20))] = b.id; }); return (usaWati() && !to.startsWith("teste:")) ? watiBotoes(to, body, botoes) : wa({ to, type: "interactive", interactive: { type: "button", body: { text: body },
+  action: { buttons: botoes.slice(0, 3).map(b => ({ type: "reply", reply: { id: b.id, title: b.titulo.slice(0, 20) } })) } } }); };
 async function marcarLidoDigitando(msgId) {
-  if (!msgId || msgId.startsWith("teste")) return;
+  if (!msgId || msgId.startsWith("teste") || usaWati()) return;
   await fetch(`${CFG.graph}/${CFG.waPhoneId}/messages`, {
     method: "POST", headers: { Authorization: `Bearer ${CFG.waToken}`, "Content-Type": "application/json" },
     body: JSON.stringify({ messaging_product: "whatsapp", status: "read", message_id: msgId, typing_indicator: { type: "text" } }),
@@ -117,6 +192,7 @@ async function baixarMidia(mediaId) {
 }
 async function enviarAudio(to, mp3) {
   if (to.startsWith("teste:")) return wa({ to, type: "audio", audio: { _sim: "data:audio/mpeg;base64," + mp3.toString("base64") } });
+  if (usaWati()) return watiArquivo(to, mp3, "xaveco.mp3", "audio/mpeg");
   const fd = new FormData();
   fd.append("messaging_product", "whatsapp");
   fd.append("type", "audio/mpeg");
@@ -258,7 +334,14 @@ async function aoReceber(phone, msg) {
   const tipo = msg.type;
   const textoBruto = tipo === "text" ? (msg.text?.body || "").trim()
     : tipo === "interactive" ? (msg.interactive?.button_reply?.id || msg.interactive?.list_reply?.id || "") : "";
-  const t = textoBruto.toLowerCase();
+  let t = textoBruto.toLowerCase();
+  const pend = botoesPendentes.get(phone), num = t.replace(/\D/g, "");
+  if (pend && num.length === 1 && t.length <= 3 && pend[num]) { t = pend[num]; botoesPendentes.delete(phone); }
+  if (TITULO_ID[normTit(t)]) t = TITULO_ID[normTit(t)];
+  if (!u.maior && /^(sim|s|tenho|tenho sim|sou maior|maior|18\+?|\+18|maior de idade)\W*$/.test(t)) t = "idade_sim";
+  if (!u.maior && /^(n[aã]o|sou menor|menor)\W*$/.test(t)) t = "idade_nao";
+  if (/^(semana|semanal|plano semana)\W*$/.test(t)) t = "plano_semana";
+  if (/^(m[eê]s|mensal|plano m[eê]s)\W*$/.test(t)) t = "plano_mes";
 
   // 1) Primeiro contato → verificação de idade
   if (!u.maior) {
@@ -419,6 +502,19 @@ http.createServer(async (req, res) => {
       }
       return;
     }
+    // --- Mensagens via WATI: no painel → Webhooks → https://SEU-APP.onrender.com/wati/SEU_SEGREDO
+    if (req.method === "POST" && url.pathname.startsWith("/wati")) {
+      if (!CFG.watiSecret || url.pathname !== "/wati/" + CFG.watiSecret) { res.writeHead(404); return res.end(); }
+      let body = {}; try { body = JSON.parse((await lerCorpo(req)).toString() || "{}"); } catch {}
+      res.writeHead(200); res.end("ok");
+      const evs = Array.isArray(body) ? body : [body];
+      for (const ev of evs) {
+        const chave = ev && (ev.whatsappMessageId || ev.id);
+        if (!chave || vistos.has(chave)) continue; vistos.add(chave); if (vistos.size > 5000) vistos.clear();
+        deWati(ev).then(m => m && aoReceber(m.from, m)).catch(e => log("Erro Wati", e.message || e));
+      }
+      return;
+    }
     // --- Webhook do Asaas
     if (req.method === "POST" && url.pathname === "/asaas") {
       if (CFG.asaasWebhookToken && req.headers["asaas-access-token"] !== CFG.asaasWebhookToken) { res.writeHead(401); return res.end(); }
@@ -467,5 +563,5 @@ http.createServer(async (req, res) => {
   } catch (e) { log("Erro HTTP", e); if (!res.headersSent) json(res, 500, { erro: "falha" }); }
 }).listen(CFG.port, async () => {
   await dbInit().catch(e => log("Erro banco", e.message));
-  log(`Xaveco no ar na porta ${CFG.port} | IA: ${CFG.openaiKey ? "ok" : "FALTA OPENAI_API_KEY"} | WhatsApp: ${CFG.waToken && CFG.waPhoneId ? "ok" : "falta configurar"} | Asaas: ${CFG.asaasKey ? "ok" : "falta"} | Voz: ${CFG.elevenKey && CFG.elevenVoice ? "ok" : "desligada"}`);
+  log(`Xaveco no ar na porta ${CFG.port} | IA: ${CFG.openaiKey ? "ok" : "FALTA OPENAI_API_KEY"} | WhatsApp: ${usaWati() ? "Wati ok" + (CFG.watiSecret ? "" : " (FALTA WATI_SECRET)") : CFG.waToken && CFG.waPhoneId ? "Meta ok" : "falta configurar"} | Asaas: ${CFG.asaasKey ? "ok" : "falta"} | Voz: ${CFG.elevenKey && CFG.elevenVoice ? "ok" : "desligada"}`);
 });
