@@ -45,10 +45,16 @@ const CFG = {
   watiToken: (E.WATI_TOKEN || "").replace(/^Bearer\s+/i, ""),
   watiCanal: (E.WATI_CANAL || "").replace(/\D/g, ""),     // número do Xaveco na Wati
   watiSecret: E.WATI_SECRET || "",                         // senha no fim da URL do webhook
+  // WhatsApp via Z-API (se ZAPI_INSTANCE_ID estiver preenchido, a Z-API tem prioridade)
+  zapiInstance: (E.ZAPI_INSTANCE_ID || "").trim(),
+  zapiToken: (E.ZAPI_TOKEN || "").trim(),
+  zapiClientToken: (E.ZAPI_CLIENT_TOKEN || "").trim(),     // "Token de segurança da conta" (opcional)
+  zapiSecret: (E.ZAPI_WEBHOOK_SECRET || "").trim(),        // senha no fim da URL do webhook
 };
 setImmediate(() => { [["Tenho 18+", "idade_sim"], ["Sou menor", "idade_nao"], [`Semana ${brl(CFG.planos.semana.valor)}`, "plano_semana"], [`Mês ${brl(CFG.planos.mes.valor)}`, "plano_mes"]]
   .forEach(([tt, id]) => { TITULO_ID[normTit(tt.slice(0, 20))] = id; }); });
-const usaWati = () => !!(CFG.watiToken && CFG.watiUrl);
+const usaZapi = () => !!(CFG.zapiInstance && CFG.zapiToken);
+const usaWati = () => !usaZapi() && !!(CFG.watiToken && CFG.watiUrl);
 const watiHost = () => { try { return new URL(CFG.watiUrl).origin; } catch { return "https://live-mt-server.wati.io"; } };
 
 const brl = v => Number(v).toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
@@ -155,6 +161,53 @@ async function watiBaixar(m) {
   }
   throw new Error("não consegui baixar a mídia da Wati");
 }
+// ---------- Z-API ----------
+const zapiBase = () => `https://api.z-api.io/instances/${encodeURIComponent(CFG.zapiInstance)}/token/${encodeURIComponent(CFG.zapiToken)}`;
+async function zapi(rota, corpo, ms = 20000) {
+  const headers = { "Content-Type": "application/json" };
+  if (CFG.zapiClientToken) headers["Client-Token"] = CFG.zapiClientToken;
+  try {
+    const r = await fetch(`${zapiBase()}/${rota}`, { method: "POST", headers, body: JSON.stringify(corpo), signal: AbortSignal.timeout(ms) });
+    if (!r.ok) log("Z-API recusou", rota, r.status, (await r.text()).slice(0, 300));
+    return r.ok;
+  } catch (e) { log("Z-API erro", rota, e.message || e); return false; }
+}
+const zapiTexto = (to, text) => zapi("send-text", { phone: to, message: text, delayTyping: Math.min(4, 1 + Math.floor(text.length / 120)) });
+async function zapiBotoes(to, body, botoes) {
+  // botões na Z-API (API não oficial) nem sempre aparecem; manda numerado — o fluxo já aceita "1" / "2"
+  botoesPendentes.set(to, Object.fromEntries(botoes.map((b, i) => [String(i + 1), b.id])));
+  return zapiTexto(to, body + "\n\n" + botoes.map((b, i) => `*${i + 1}* - ${b.titulo}`).join("\n"));
+}
+const zapiAudio = (to, mp3) => zapi("send-audio", { phone: to, audio: "data:audio/mpeg;base64," + mp3.toString("base64"), waveform: true }, 40000);
+function urlSegura(raw) {
+  let u; try { u = new URL(raw); } catch { return false; }
+  if (u.protocol !== "https:" || u.username || u.password || u.port) return false;
+  const h = u.hostname.toLowerCase();
+  return h.includes(".") && h !== "localhost" && !/^[\d.]+$/.test(h) && !h.includes(":") && !/\.(local|internal)$/.test(h);
+}
+async function zapiBaixar(url, mime) {
+  if (!urlSegura(url)) throw new Error("URL de mídia não permitida");
+  const r = await fetch(url, { signal: AbortSignal.timeout(25000) });
+  if (!r.ok) throw new Error("download da mídia falhou " + r.status);
+  const buf = Buffer.from(await r.arrayBuffer());
+  if (buf.length > 16 * 1024 * 1024) throw new Error("mídia grande demais");
+  return { buf, mime: (mime || r.headers.get("content-type") || "application/octet-stream").split(";")[0] };
+}
+// converte o evento "Ao receber" da Z-API no formato que o fluxo entende
+async function deZapi(b) {
+  if (!b || b.type !== "ReceivedCallback" || b.fromMe || b.isGroup || b.broadcast || b.isNewsletter) return null;
+  const from = String(b.phone || "").replace(/\D/g, "");
+  if (!/^\d{8,15}$/.test(from)) return null;
+  const m = { id: String(b.messageId || "z" + Date.now()), from, _nome: b.senderName || b.chatName || "" };
+  const rep = b.buttonsResponseMessage || b.listResponseMessage;
+  if (rep) { const tit = String(rep.message || rep.title || "").trim(); m.type = "interactive"; m.interactive = { button_reply: { id: rep.buttonId || rep.selectedRowId || TITULO_ID[normTit(tit)] || tit } }; }
+  else if (b.image?.imageUrl) { m.type = "image"; m.image = { caption: b.image.caption || "" }; m._imagem = await zapiBaixar(b.image.imageUrl, b.image.mimeType); }
+  else if (b.audio?.audioUrl) { m.type = "audio"; m.audio = {}; m._audio = await zapiBaixar(b.audio.audioUrl, b.audio.mimeType); }
+  else if (b.document?.documentUrl && /^image\//.test(b.document.mimeType || "")) { m.type = "image"; m.image = { caption: b.document.caption || "" }; m._imagem = await zapiBaixar(b.document.documentUrl, b.document.mimeType); }
+  else if (b.text && typeof b.text.message === "string") { m.type = "text"; m.text = { body: b.text.message.slice(0, 4000) }; }
+  else m.type = "outro";
+  return m;
+}
 // título do botão → id interno (a Wati devolve o texto do botão)
 const TITULO_ID = {};
 const normTit = x => String(x).replace(/\u00a0/g, " ").trim().toLowerCase();
@@ -175,11 +228,11 @@ async function deWati(b) {
   return m;
 }
 
-const enviarTexto = (to, body) => (usaWati() && !to.startsWith("teste:")) ? watiTexto(to, body) : wa({ to, type: "text", text: { body, preview_url: false } });
-const enviarBotoes = (to, body, botoes) => { botoes.forEach(b => { TITULO_ID[normTit(b.titulo.slice(0, 20))] = b.id; }); return (usaWati() && !to.startsWith("teste:")) ? watiBotoes(to, body, botoes) : wa({ to, type: "interactive", interactive: { type: "button", body: { text: body },
+const enviarTexto = (to, body) => (usaZapi() && !to.startsWith("teste:")) ? zapiTexto(to, body) : (usaWati() && !to.startsWith("teste:")) ? watiTexto(to, body) : wa({ to, type: "text", text: { body, preview_url: false } });
+const enviarBotoes = (to, body, botoes) => { botoes.forEach(b => { TITULO_ID[normTit(b.titulo.slice(0, 20))] = b.id; }); return (usaZapi() && !to.startsWith("teste:")) ? zapiBotoes(to, body, botoes) : (usaWati() && !to.startsWith("teste:")) ? watiBotoes(to, body, botoes) : wa({ to, type: "interactive", interactive: { type: "button", body: { text: body },
   action: { buttons: botoes.slice(0, 3).map(b => ({ type: "reply", reply: { id: b.id, title: b.titulo.slice(0, 20) } })) } } }); };
 async function marcarLidoDigitando(msgId) {
-  if (!msgId || msgId.startsWith("teste") || usaWati()) return;
+  if (!msgId || msgId.startsWith("teste") || usaWati() || usaZapi()) return;
   await fetch(`${CFG.graph}/${CFG.waPhoneId}/messages`, {
     method: "POST", headers: { Authorization: `Bearer ${CFG.waToken}`, "Content-Type": "application/json" },
     body: JSON.stringify({ messaging_product: "whatsapp", status: "read", message_id: msgId, typing_indicator: { type: "text" } }),
@@ -192,6 +245,7 @@ async function baixarMidia(mediaId) {
 }
 async function enviarAudio(to, mp3) {
   if (to.startsWith("teste:")) return wa({ to, type: "audio", audio: { _sim: "data:audio/mpeg;base64," + mp3.toString("base64") } });
+  if (usaZapi()) return zapiAudio(to, mp3);
   if (usaWati()) return watiArquivo(to, mp3, "xaveco.mp3", "audio/mpeg");
   const fd = new FormData();
   fd.append("messaging_product", "whatsapp");
@@ -502,6 +556,17 @@ http.createServer(async (req, res) => {
       }
       return;
     }
+    // --- Mensagens via Z-API: painel → Webhooks → "Ao receber" → https://SEU-APP.onrender.com/zapi/SEU_SEGREDO
+    if (req.method === "POST" && url.pathname.startsWith("/zapi")) {
+      const dado = Buffer.from(url.pathname.slice(6)), certo = Buffer.from(CFG.zapiSecret);
+      if (!CFG.zapiSecret || url.pathname.slice(0, 6) !== "/zapi/" || dado.length !== certo.length || !crypto.timingSafeEqual(dado, certo)) { res.writeHead(404); return res.end(); }
+      let body = {}; try { body = JSON.parse((await lerCorpo(req)).toString() || "{}"); } catch {}
+      res.writeHead(200); res.end("ok");
+      const chave = body && body.messageId;
+      if (!chave || vistos.has(chave)) return; vistos.add(chave); if (vistos.size > 5000) vistos.clear();
+      deZapi(body).then(m => m && aoReceber(m.from, m)).catch(e => log("Erro Z-API", e.message || e));
+      return;
+    }
     // --- Mensagens via WATI: no painel → Webhooks → https://SEU-APP.onrender.com/wati/SEU_SEGREDO
     if (req.method === "POST" && url.pathname.startsWith("/wati")) {
       if (!CFG.watiSecret || url.pathname !== "/wati/" + CFG.watiSecret) { res.writeHead(404); return res.end(); }
@@ -563,5 +628,5 @@ http.createServer(async (req, res) => {
   } catch (e) { log("Erro HTTP", e); if (!res.headersSent) json(res, 500, { erro: "falha" }); }
 }).listen(CFG.port, async () => {
   await dbInit().catch(e => log("Erro banco", e.message));
-  log(`Xaveco no ar na porta ${CFG.port} | IA: ${CFG.openaiKey ? "ok" : "FALTA OPENAI_API_KEY"} | WhatsApp: ${usaWati() ? "Wati ok" + (CFG.watiSecret ? "" : " (FALTA WATI_SECRET)") : CFG.waToken && CFG.waPhoneId ? "Meta ok" : "falta configurar"} | Asaas: ${CFG.asaasKey ? "ok" : "falta"} | Voz: ${CFG.elevenKey && CFG.elevenVoice ? "ok" : "desligada"}`);
+  log(`Xaveco no ar na porta ${CFG.port} | IA: ${CFG.openaiKey ? "ok" : "FALTA OPENAI_API_KEY"} | WhatsApp: ${usaZapi() ? "Z-API ok" + (CFG.zapiSecret ? "" : " (FALTA ZAPI_WEBHOOK_SECRET)") : usaWati() ? "Wati ok" + (CFG.watiSecret ? "" : " (FALTA WATI_SECRET)") : CFG.waToken && CFG.waPhoneId ? "Meta ok" : "falta configurar"} | Asaas: ${CFG.asaasKey ? "ok" : "falta"} | Voz: ${CFG.elevenKey && CFG.elevenVoice ? "ok" : "desligada"}`);
 });
