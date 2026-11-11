@@ -418,20 +418,24 @@ Me conta a situação (escrito ou áudio), manda o print da conversa ou do perfi
 Comandos: *assinar* · *status* · *voz off* / *voz on*`;
 const espera = (to, txt) => to.startsWith("teste:") ? Promise.resolve() : new Promise(r => setTimeout(r, Math.min(700 + String(txt).length * 30, 3500)));
 
+const mascara = p => String(p).replace(/^(\d{4})\d+(\d{4})$/, "$1****$2");
 async function aoReceber(phone, msg) {
   const u = await getUser(phone);
+  log("Recebi", mascara(phone), msg.type, msg.type === "text" ? JSON.stringify(String(msg.text?.body || "").slice(0, 40)) : msg.type === "interactive" ? msg.interactive?.button_reply?.id : "", "| estado:", u.estado);
   if (msg._nome && !u.nome) u.nome = String(msg._nome).split(" ")[0].slice(0, 30);
   const tipo = msg.type;
   const textoBruto = tipo === "text" ? (msg.text?.body || "").trim()
     : tipo === "interactive" ? (msg.interactive?.button_reply?.id || msg.interactive?.list_reply?.id || "") : "";
   let t = textoBruto.toLowerCase();
-  const pend = botoesPendentes.get(phone), num = t.replace(/\D/g, "");
-  if (pend && num.length === 1 && t.length <= 3 && pend[num]) { t = pend[num]; botoesPendentes.delete(phone); }
+  const pend = botoesPendentes.get(phone) || u.opcoes, num = t.replace(/\D/g, "");
+  if (pend && num.length === 1 && t.length <= 3 && pend[num]) { t = pend[num]; botoesPendentes.delete(phone); u.opcoes = null; }
+  else if (u.opcoes && tipo === "text") u.opcoes = null; // falou outra coisa: esquece as opções
   if (TITULO_ID[normTit(t)]) t = TITULO_ID[normTit(t)];
   if (!u.maior && /^(sim|s|tenho|tenho sim|sou maior|maior|18\+?|\+18|maior de idade)\W*$/.test(t)) t = "idade_sim";
   if (!u.maior && /^(n[aã]o|sou menor|menor)\W*$/.test(t)) t = "idade_nao";
-  if (/^(semana|semanal|plano semana)\W*$/.test(t)) t = "plano_semana";
-  if (/^(m[eê]s|mensal|plano m[eê]s)\W*$/.test(t)) t = "plano_mes";
+  if (/^(quero\s+)?(o\s+)?(plano\s+)?(de\s+)?(1\s+)?(semana|semanal)\W*$/.test(t)) t = "plano_semana";
+  if (/^(quero\s+)?(o\s+)?(plano\s+)?(de\s+)?(1\s+)?(m[eê]s|mensal)\W*$/.test(t)) t = "plano_mes";
+  if (/^(assinar|assina|quero assinar|pagar|plano|planos|pix)\W*$/.test(t)) t = "assinar";
 
   // 1) Primeiro contato → verificação de idade
   if (!u.maior) {
@@ -452,7 +456,7 @@ async function aoReceber(phone, msg) {
     return enviarTexto(phone, assinante(u) ? `✅ Xaveco ilimitado até *${dataBR(u.ate)}*.`
       : `Você usou ${Math.min(u.gratisUsados, CFG.gratis)} de ${CFG.gratis} xavecos grátis. Manda *assinar* pra liberar ilimitado.`);
   }
-  if (t === "assinar" || t === "plano" || t === "pagar") return oferecerPlanos(u);
+  if (t === "assinar") { u.opcoes = { 1: "plano_semana", 2: "plano_mes" }; await saveUser(u); log("Ofereci planos", mascara(phone)); return oferecerPlanos(u); }
   if (t === "plano_semana" || t === "plano_mes") {
     u.planoPendente = t.replace("plano_", "");
     if (!usaMP() && !u.asaasCliente) { u.estado = "cpf"; await saveUser(u);
@@ -532,6 +536,7 @@ async function oferecerPlanos(u, acabou = false) {
 async function mandarPix(u) {
   try {
     const code = await gerarPix(u, u.planoPendente || "mes");
+    log("Pix gerado", mascara(u.phone), u.planoPendente || "mes");
     await enviarTexto(u.phone, `💸 *Pix do Xaveco — ${CFG.planos[u.planoPendente || "mes"].nome} (${brl(CFG.planos[u.planoPendente || "mes"].valor)})*\n\nCopia o código abaixo e cola no app do seu banco em *Pix Copia e Cola*. Assim que cair, eu libero automaticamente ✅`);
     await enviarTexto(u.phone, code);
   } catch (e) { log(e.message); await enviarTexto(u.phone, "Deu ruim pra gerar o Pix agora 😕 Tenta de novo em alguns minutos mandando *assinar*."); }
