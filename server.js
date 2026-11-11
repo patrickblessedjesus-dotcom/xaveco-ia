@@ -1,7 +1,7 @@
 // ============================================================
 //  XAVECO — assistente de conversa no WhatsApp
 //  Lê print/áudio/texto → 3 respostas + termômetro (+ áudio com a voz do Patrick)
-//  3 usos grátis → assinatura via Pix (Asaas), liberação automática
+//  3 usos grátis → assinatura via Pix (Mercado Pago ou Asaas), liberação automática
 // ============================================================
 const http = require("http");
 const crypto = require("crypto");
@@ -29,6 +29,11 @@ const CFG = {
   asaasKey: E.ASAAS_API_KEY || "",
   asaasUrl: E.ASAAS_URL || "https://api.asaas.com/v3", // sandbox: https://api-sandbox.asaas.com/v3
   asaasWebhookToken: E.ASAAS_WEBHOOK_TOKEN || "",
+  // Mercado Pago (se MP_ACCESS_TOKEN estiver preenchido, ele é usado no lugar do Asaas)
+  mpToken: (E.MP_ACCESS_TOKEN || "").trim(),
+  mpSecret: (E.MP_WEBHOOK_SECRET || "").trim(),            // senha no fim da URL de aviso
+  mpEmail: (E.MP_EMAIL_PAGADOR || "pagador@xaveco.com.br").trim(), // o MP exige um e-mail do pagador
+  publicUrl: (E.PUBLIC_URL || E.RENDER_EXTERNAL_URL || "https://xaveco.onrender.com").replace(/\/+$/, ""),
   // Regras do negócio
   gratis: Number(E.USOS_GRATIS || 3),
   limiteDiario: Number(E.LIMITE_DIARIO_ASSINANTE || 120), // mensagens/dia do assinante
@@ -363,7 +368,38 @@ function cpfValido(c) {
   const dv = n => { let s = 0; for (let i = 0; i < n; i++) s += +c[i] * (n + 1 - i); const r = (s * 10) % 11; return r === 10 ? 0 : r; };
   return dv(9) === +c[9] && dv(10) === +c[10];
 }
+// ---------- Mercado Pago ----------
+const usaMP = () => !!CFG.mpToken;
+async function mp(method, p, body) {
+  const headers = { Authorization: `Bearer ${CFG.mpToken}`, "Content-Type": "application/json" };
+  if (method === "POST") headers["X-Idempotency-Key"] = crypto.randomUUID();
+  const r = await fetch("https://api.mercadopago.com" + p, { method, headers, body: body ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(20000) });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(`Mercado Pago ${p}: ${r.status} ${JSON.stringify(j).slice(0, 300)}`);
+  return j;
+}
+async function gerarPixMP(u, plano) {
+  const p = CFG.planos[plano];
+  const pay = await mp("POST", "/v1/payments", {
+    transaction_amount: Number(p.valor.toFixed(2)), payment_method_id: "pix",
+    description: `Xaveco ilimitado — ${p.nome}`, external_reference: `${u.phone}|${plano}`,
+    payer: { email: CFG.mpEmail, first_name: (u.nome || "Cliente").slice(0, 30) },
+    notification_url: CFG.mpSecret ? `${CFG.publicUrl}/mp/${CFG.mpSecret}` : undefined,
+    date_of_expiration: new Date(Date.now() + 24 * 3600e3).toISOString().replace("Z", "-00:00"),
+  });
+  await savePay(String(pay.id), u.phone, plano, "PENDING");
+  const code = pay.point_of_interaction?.transaction_data?.qr_code;
+  if (!code) throw new Error("Mercado Pago não devolveu o Pix copia e cola: " + JSON.stringify(pay).slice(0, 200));
+  return code;
+}
+// confere no Mercado Pago (não confia só no aviso) e libera
+async function conferirMP(id) {
+  const pay = await mp("GET", `/v1/payments/${encodeURIComponent(id)}`);
+  if (pay.status !== "approved") return log("MP pagamento", id, pay.status);
+  await pagamentoConfirmado({ id: String(pay.id), externalReference: pay.external_reference });
+}
 async function gerarPix(u, plano) {
+  if (usaMP()) return gerarPixMP(u, plano);
   const p = CFG.planos[plano];
   const pay = await asaas("POST", "/payments", { customer: u.asaasCliente, billingType: "PIX", value: p.valor, dueDate: hojeSP(),
     description: `Xaveco ilimitado — ${p.nome}`, externalReference: `${u.phone}|${plano}` });
@@ -419,7 +455,7 @@ async function aoReceber(phone, msg) {
   if (t === "assinar" || t === "plano" || t === "pagar") return oferecerPlanos(u);
   if (t === "plano_semana" || t === "plano_mes") {
     u.planoPendente = t.replace("plano_", "");
-    if (!u.asaasCliente) { u.estado = "cpf"; await saveUser(u);
+    if (!usaMP() && !u.asaasCliente) { u.estado = "cpf"; await saveUser(u);
       return enviarTexto(phone, "Boa! 🔥 Pra gerar o Pix, o banco pede seu *CPF* (só números). Ele vai direto pro sistema de pagamento, eu não guardo."); }
     await saveUser(u); return mandarPix(u);
   }
@@ -580,6 +616,17 @@ http.createServer(async (req, res) => {
       }
       return;
     }
+    // --- Aviso do Mercado Pago (a URL vai junto em cada Pix gerado)
+    if (url.pathname.startsWith("/mp/")) {
+      const dado = Buffer.from(url.pathname.slice(4)), certo = Buffer.from(CFG.mpSecret);
+      if (!CFG.mpSecret || dado.length !== certo.length || !crypto.timingSafeEqual(dado, certo)) { res.writeHead(404); return res.end(); }
+      let body = {}; try { body = JSON.parse((await lerCorpo(req, 1e6)).toString() || "{}"); } catch {}
+      res.writeHead(200); res.end("ok");
+      const tipo = body.type || body.topic || url.searchParams.get("type") || url.searchParams.get("topic");
+      const id = body.data?.id || url.searchParams.get("data.id") || url.searchParams.get("id");
+      if (tipo === "payment" && id && /^\d{1,25}$/.test(String(id))) conferirMP(String(id)).catch(e => log("Erro MP", e.message || e));
+      return;
+    }
     // --- Webhook do Asaas
     if (req.method === "POST" && url.pathname === "/asaas") {
       if (CFG.asaasWebhookToken && req.headers["asaas-access-token"] !== CFG.asaasWebhookToken) { res.writeHead(401); return res.end(); }
@@ -628,5 +675,5 @@ http.createServer(async (req, res) => {
   } catch (e) { log("Erro HTTP", e); if (!res.headersSent) json(res, 500, { erro: "falha" }); }
 }).listen(CFG.port, async () => {
   await dbInit().catch(e => log("Erro banco", e.message));
-  log(`Xaveco no ar na porta ${CFG.port} | IA: ${CFG.openaiKey ? "ok" : "FALTA OPENAI_API_KEY"} | WhatsApp: ${usaZapi() ? "Z-API ok" + (CFG.zapiSecret ? "" : " (FALTA ZAPI_WEBHOOK_SECRET)") : usaWati() ? "Wati ok" + (CFG.watiSecret ? "" : " (FALTA WATI_SECRET)") : CFG.waToken && CFG.waPhoneId ? "Meta ok" : "falta configurar"} | Asaas: ${CFG.asaasKey ? "ok" : "falta"} | Voz: ${CFG.elevenKey && CFG.elevenVoice ? "ok" : "desligada"}`);
+  log(`Xaveco no ar na porta ${CFG.port} | IA: ${CFG.openaiKey ? "ok" : "FALTA OPENAI_API_KEY"} | WhatsApp: ${usaZapi() ? "Z-API ok" + (CFG.zapiSecret ? "" : " (FALTA ZAPI_WEBHOOK_SECRET)") : usaWati() ? "Wati ok" + (CFG.watiSecret ? "" : " (FALTA WATI_SECRET)") : CFG.waToken && CFG.waPhoneId ? "Meta ok" : "falta configurar"} | Pagamento: ${usaMP() ? "Mercado Pago ok" + (CFG.mpSecret ? "" : " (FALTA MP_WEBHOOK_SECRET)") : CFG.asaasKey ? "Asaas ok" : "falta"} | Voz: ${CFG.elevenKey && CFG.elevenVoice ? "ok" : "desligada"}`);
 });
