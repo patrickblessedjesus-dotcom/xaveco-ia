@@ -33,6 +33,7 @@ const CFG = {
   mpToken: (E.MP_ACCESS_TOKEN || "").trim(),
   mpSecret: (E.MP_WEBHOOK_SECRET || "").trim(),            // senha no fim da URL de aviso
   mpEmail: (E.MP_EMAIL_PAGADOR || "pagador@xaveco.com.br").trim(), // o MP exige um e-mail do pagador
+  bloqueados: (E.BLOQUEADOS || "").split(",").map(x => x.replace(/\D/g, "")).filter(Boolean), // números que o Xaveco ignora
   publicUrl: (E.PUBLIC_URL || E.RENDER_EXTERNAL_URL || "https://xaveco.onrender.com").replace(/\/+$/, ""),
   // Regras do negócio
   gratis: Number(E.USOS_GRATIS || 3),
@@ -420,6 +421,7 @@ const espera = (to, txt) => to.startsWith("teste:") ? Promise.resolve() : new Pr
 
 const mascara = p => String(p).replace(/^(\d{4})\d+(\d{4})$/, "$1****$2");
 async function aoReceber(phone, msg) {
+  if (CFG.bloqueados.some(b => String(phone).replace(/\D/g, "").endsWith(b.slice(-10)))) return log("Ignorei número bloqueado", mascara(phone));
   const u = await getUser(phone);
   log("Recebi", mascara(phone), msg.type, msg.type === "text" ? JSON.stringify(String(msg.text?.body || "").slice(0, 40)) : msg.type === "interactive" ? msg.interactive?.button_reply?.id : "", "| estado:", u.estado);
   if (msg._nome && !u.nome) u.nome = String(msg._nome).split(" ")[0].slice(0, 30);
